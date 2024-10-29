@@ -1,16 +1,17 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[46]:
+# In[24]:
 
 
 import numpy as np
 import cv2
 from scipy.special import eval_chebyt
 import matplotlib.pyplot as plt
+import cupy as cp
 
 
-# In[47]:
+# In[25]:
 
 
 def convert_to_polar(image):
@@ -34,16 +35,13 @@ def convert_to_polar(image):
     X, Y = np.meshgrid(x, y)
     
     # Convert to polar coordinates
-    r = np.sqrt(X**2 + Y**2)
+    r = np.sqrt(X**2 + Y**2) / np.max([center[0], center[1]])  # Normalize r to the range [0, 1]
     theta = np.arctan2(Y, X)
-    
-    # Normalize r to the range [0, 1]
-    r = r / np.max(r)
     
     return image, r, theta
 
 
-# In[48]:
+# In[26]:
 
 
 def radial_basis_function(n, t, r):
@@ -70,8 +68,26 @@ def radial_basis_function(n, t, r):
     
     return Rtn
 
+# GPU-accelerated version of radial_basis_function
+def radial_basis_function_gpu(n, t, r):
+    
+    # Compute factorials on CPU first, then transfer to GPU
+    factorials = cp.array([np.math.factorial(n - k) for k in range(n // 2 + 1)], dtype=cp.float32)
+    
+    Rtn = cp.zeros_like(r, dtype=cp.float32)
 
-# In[49]:
+    # Use a loop to compute each term to manage memory usage
+    for k in range(n // 2 + 1):
+        coeff = (-1)**k * factorials[k] / (np.math.factorial(k) * np.math.factorial(n - 2 * k))
+        Rtn += coeff * (4 * r**t - 2)**(n - 2 * k)
+
+    # Apply the fractional term after the loop
+    result = cp.sqrt(t) * r**(t - 1) * Rtn
+
+    return result
+
+
+# In[27]:
 
 
 def compute_weighted_amplitude(frchfm, tau=1, xi=1):
@@ -86,26 +102,19 @@ def compute_weighted_amplitude(frchfm, tau=1, xi=1):
     Returns:
         wa_top24 (1D numpy array): Array containing the top 24 weighted amplitudes.
     """
-    # Initialize weighted amplitude matrix with zeros
-    wa_matrix = np.zeros_like(frchfm, dtype=float)
-    
-    # Calculate weighted amplitudes
-    for n in range(frchfm.shape[0]):
-        for m in range(frchfm.shape[1]):
-            # Calculate weight w_nm = tau * n + xi * m
-            weight_w_nm = tau * n + xi * m
-            # Calculate |Anm| (the amplitude of the FrCHFM) and apply the weight
-            wa_matrix[n, m] = weight_w_nm * abs(frchfm[n, m])
-    
-    # Flatten WA matrix and get top 24 intensity moments
-    wa_flat = wa_matrix.flatten()
-    wa_top24 = np.sort(wa_flat)[-24:]  # Get the 24 largest intensities
-    
-    return wa_top24
+    # Generate weights in a vectorized form
+    n_indices = np.arange(frchfm.shape[0])
+    m_indices = np.arange(frchfm.shape[1])
+    weight_matrix = tau * n_indices[:, None] + xi * m_indices[None, :]
+
+    # Apply weights to the absolute values of frchfm and flatten
+    wa_flat = (weight_matrix * np.abs(frchfm)).flatten()
+
+    # Return the top 24 values
+    return np.partition(wa_flat, -24)[-24:]
 
 
-
-# In[50]:
+# In[28]:
 
 
 def compute_frchfm(image, max_degree, t):
@@ -124,29 +133,66 @@ def compute_frchfm(image, max_degree, t):
     polar_image, r, theta = convert_to_polar(image)
     
     # Fourier transform in angular direction (theta)
-    F_image = np.fft.fft2(polar_image)
-    F_image_shifted = np.fft.fftshift(F_image)
-    
+    F_image = np.fft.fftshift(np.fft.fft2(polar_image))
+
     # Initialize an array to store the FrCHFMs
-    frchfm = np.zeros((max_degree + 1, max_degree + 1), dtype=np.complex128)
-    
-    # Loop over degrees for Chebyshev polynomials
+    frchfm = np.zeros((max_degree + 1, 2 * max_degree + 1), dtype=np.complex128)
+
+    # Precompute angular components and store radial basis for each degree n
+    m_values = np.arange(-max_degree, max_degree + 1)
+    angular_components = np.exp(-1j * m_values[:, None, None] * theta)  # Broadcasting over m, theta
+
     for n in range(max_degree + 1):
-        for m in range(-max_degree, max_degree + 1):
-            # Compute the radial basis function
-            Rtn = radial_basis_function(n, t, r)
-            
-            # Angular Fourier component exp(-jmθ)
-            angular_component = np.exp(-1j * m * theta)
-            
-            # Compute the FrCHFM using the formula
-            frchfm[n, m] = np.sum(F_image_shifted * Rtn * angular_component * r)
-    
+        # Precompute the radial basis function once per degree
+        Rtn = radial_basis_function(n, t, r)
+
+        # Compute each FrCHFM moment using the precomputed angular components
+        for idx, m in enumerate(m_values):
+            frchfm[n, idx] = np.sum(F_image * Rtn * angular_components[idx] * r)
+
     return frchfm
 
+# GPU-accelerated version of compute_frchfm
+def compute_frchfm_gpu(image, max_degree, t):
+    """
+    Compute Fractional Chebyshev-Fourier moments (FrCHFMs) of an input image on the GPU.
+    
+    Parameters:
+        image (2D numpy array): Grayscale image.
+        max_degree (int): Maximum degree of the Chebyshev polynomial.
+        t (float): Fractional parameter.
+    
+    Returns:
+        frchfm (2D numpy array): The computed Fractional Chebyshev-Fourier moments.
+    """
+    # Convert image to polar coordinates and then transfer to GPU
+    polar_image, r, theta = convert_to_polar(image)
+    polar_image_gpu = cp.array(polar_image)
+    r_gpu = cp.array(r)
+    theta_gpu = cp.array(theta)
+    
+    # Fourier transform in angular direction (theta), shifted and moved to GPU
+    F_image = cp.fft.fftshift(cp.fft.fft2(polar_image_gpu))
+
+    # Initialize an array on GPU to store the FrCHFMs
+    frchfm_gpu = cp.zeros((max_degree + 1, 2 * max_degree + 1), dtype=cp.complex128)
+
+    # Precompute angular components on GPU
+    m_values = cp.arange(-max_degree, max_degree + 1)
+    angular_components = cp.exp(-1j * m_values[:, None, None] * theta_gpu)
+
+    for n in range(max_degree + 1):
+        # Compute radial basis function for each degree
+        Rtn_gpu = radial_basis_function_gpu(n, t, r_gpu)
+
+        # Compute FrCHFMs for each value of m in a vectorized way
+        frchfm_gpu[n, :] = cp.sum(F_image * Rtn_gpu * angular_components * r_gpu, axis=(1, 2))
+
+    # Transfer result back to CPU
+    return cp.asnumpy(frchfm_gpu)
 
 
-# In[51]:
+# In[29]:
 
 
 def generate_binary_sequence(frchfm, tau=1, xi=1):
@@ -187,7 +233,7 @@ def generate_binary_sequence(frchfm, tau=1, xi=1):
     return binary_sequence_str
 
 
-# In[52]:
+# In[30]:
 
 
 def get_wa_sequences_for_group(image_group):
@@ -214,7 +260,7 @@ def get_wa_sequences_for_group(image_group):
     return wa_sequences
 
 
-# In[53]:
+# In[31]:
 
 
 def construct_binary_sequence_mapping(image_groups): # PUT THIS SOMEWHERE ELSE. NOT RELATED TO FrCHFM LOGIC
@@ -246,7 +292,7 @@ def construct_binary_sequence_mapping(image_groups): # PUT THIS SOMEWHERE ELSE. 
     return binary_sequence_mapping
 
 
-# In[54]:
+# In[32]:
 
 
 def demofunctions():
@@ -275,13 +321,13 @@ def demofunctions():
     plt.show()
 
 
-# In[55]:
+# In[33]:
 
 
 get_ipython().system('jupyter nbconvert --to python FrCHFM.ipynb')
 
 
-# In[56]:
+# In[34]:
 
 
 #pip install opencv-python
